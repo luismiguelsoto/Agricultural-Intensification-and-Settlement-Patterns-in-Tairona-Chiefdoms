@@ -1,0 +1,1039 @@
+---
+title: "Agricultural Intensification and Settlement Patterns in Tairona Chiefdoms (AD 100-1600)"
+author: "Luis Miguel Soto Rodriguez, University of Pittsburgh"
+date: "`r Sys.Date()`"
+subtitle: "Final Corrected Analysis Notebook - JASREP Spring 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    fig_width: 12
+    fig_height: 8
+  word_document:
+    toc: true
+    toc_depth: 3
+  pdf_document:
+    toc: true
+    toc_depth: 3
+  html_notebook:
+    toc: true
+    toc_depth: 3
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 12,
+  fig.height = 8,
+  dpi = 150
+)
+options(scipen = 999)
+```
+
+# Package Loading and Data Input
+
+```{r packages}
+packages <- c(
+  "sf", "terra", "dplyr", "tibble", "ggplot2", "tidyr",
+  "spatstat.geom", "spatstat.explore", "spatstat.random", "spatstat",
+  "igraph", "patchwork", "ggspatial", "scales", "viridis",
+  "vegan", "ggrepel", "knitr", "broom", "ggpubr", "ggsignif"
+)
+
+invisible(lapply(packages, function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, dependencies = TRUE)
+  }
+}))
+
+invisible(lapply(packages, function(p) {
+  suppressPackageStartupMessages(library(p, character.only = TRUE))
+}))
+
+set.seed(42)
+target_crs <- 32618
+```
+
+```{r data-loading}
+github_base <- "https://raw.githubusercontent.com/luismiguelsoto/Agricultural-Intensification-and-Settlement-Patterns-in-Tairona-Chiefdoms/main/GIS/"
+gis_dir <- file.path(tempdir(), "GIS_JASREP")
+if (!dir.exists(gis_dir)) dir.create(gis_dir, recursive = TRUE)
+
+gis_files <- c(
+  "Neguanje_structures.shp", "Neguanje_structures.shx", "Neguanje_structures.dbf", "Neguanje_structures.prj",
+  "Buritaca_structures.shp", "Buritaca_structures.shx", "Buritaca_structures.dbf", "Buritaca_structures.prj",
+  "Tairona_structures.shp", "Tairona_structures.shx", "Tairona_structures.dbf", "Tairona_structures.prj",
+  "Rio_Frio_Sitios_Neguanje.shp", "Rio_Frio_Sitios_Neguanje.shx", "Rio_Frio_Sitios_Neguanje.dbf", "Rio_Frio_Sitios_Neguanje.prj",
+  "Rio_Frio_Sitios_Buritaca.shp", "Rio_Frio_Sitios_Buritaca.shx", "Rio_Frio_Sitios_Buritaca.dbf", "Rio_Frio_Sitios_Buritaca.prj",
+  "Rio_Frio_Sitios_Tairona.shp", "Rio_Frio_Sitios_Tairona.shx", "Rio_Frio_Sitios_Tairona.dbf", "Rio_Frio_Sitios_Tairona.prj",
+  "Rio_Frio_Limite_Survey.shp", "Rio_Frio_Limite_Survey.shx", "Rio_Frio_Limite_Survey.dbf", "Rio_Frio_Limite_Survey.prj",
+  "SOILS_AGRICULTURE_RASTER_52KM.tif"
+)
+
+for (f in gis_files) {
+  dest <- file.path(gis_dir, f)
+  if (!file.exists(dest)) download.file(paste0(github_base, f), dest, mode = "wb", quiet = TRUE)
+}
+
+struc_neg <- st_read(file.path(gis_dir, "Neguanje_structures.shp"), quiet = TRUE) %>%
+  st_transform(target_crs) %>%
+  mutate(Period = "Neguanje")
+struc_bur <- st_read(file.path(gis_dir, "Buritaca_structures.shp"), quiet = TRUE) %>%
+  st_transform(target_crs) %>%
+  mutate(Period = "Buritaca")
+struc_tai <- st_read(file.path(gis_dir, "Tairona_structures.shp"), quiet = TRUE) %>%
+  st_transform(target_crs) %>%
+  mutate(Period = "Tairona")
+
+sites_neg <- st_read(file.path(gis_dir, "Rio_Frio_Sitios_Neguanje.shp"), quiet = TRUE) %>%
+  st_transform(target_crs) %>%
+  mutate(Period = "Neguanje")
+sites_bur <- st_read(file.path(gis_dir, "Rio_Frio_Sitios_Buritaca.shp"), quiet = TRUE) %>%
+  st_transform(target_crs) %>%
+  mutate(Period = "Buritaca")
+sites_tai <- st_read(file.path(gis_dir, "Rio_Frio_Sitios_Tairona.shp"), quiet = TRUE) %>%
+  st_transform(target_crs) %>%
+  mutate(Period = "Tairona")
+
+survey <- st_read(file.path(gis_dir, "Rio_Frio_Limite_Survey.shp"), quiet = TRUE) %>%
+  st_transform(target_crs) %>%
+  st_union() %>%
+  st_make_valid()
+
+survey_sf <- st_sf(geometry = survey)
+survey_union <- survey_sf
+soils_r <- terra::rast(file.path(gis_dir, "SOILS_AGRICULTURE_RASTER_52KM.tif"))
+A_km2 <- as.numeric(st_area(survey_sf)) / 1e6
+A_m2 <- as.numeric(st_area(survey_sf))
+periods <- c("Neguanje", "Buritaca", "Tairona")
+
+data_by_period <- list(
+  Neguanje = list(structures = struc_neg, sites = sites_neg),
+  Buritaca = list(structures = struc_bur, sites = sites_bur),
+  Tairona = list(structures = struc_tai, sites = sites_tai)
+)
+```
+
+# Killion Metrics and Soil Quality
+
+```{r killion-metrics-soil}
+compute_killion_metrics_with_soil <- function(struc_sf, soils_raster) {
+  coords <- st_coordinates(struc_sf)
+  n <- nrow(struc_sf)
+  diameters <- struc_sf$Diam_Terra
+  D <- as.matrix(dist(coords))
+  diag(D) <- Inf
+  NND <- numeric(n)
+  NN_idx <- integer(n)
+  Available_Space <- numeric(n)
+
+  for (i in seq_len(n)) {
+    nn_i <- which.min(D[i, ])
+    NND[i] <- D[i, nn_i]
+    NN_idx[i] <- nn_i
+    Available_Space[i] <- max(0, NND[i] - diameters[i] / 2 - diameters[nn_i] / 2)
+  }
+
+  v_pts <- terra::project(terra::vect(struc_sf), terra::crs(soils_raster))
+  soil_val <- terra::extract(soils_raster, v_pts, ID = FALSE)
+  struc_sf$NNDist <- NND
+  struc_sf$NN_Index <- NN_idx
+  struc_sf$Available_Space <- Available_Space
+  struc_sf$Core_Area <- pi * (diameters / 2)^2
+  struc_sf$Soil_Quality <- soil_val[[1]]
+  struc_sf$Soil_Category <- cut(
+    struc_sf$Soil_Quality,
+    breaks = c(0, 2, 4, 6),
+    labels = c("Low (1-2)", "Medium (3-4)", "High (5-6)"),
+    include.lowest = TRUE
+  )
+  struc_sf$log_AvailSpace <- log(Available_Space + 1)
+  struc_sf$Space_Core_Ratio <- Available_Space / (pi * (diameters / 2)^2 + 1)
+  struc_sf
+}
+
+struc_neg <- compute_killion_metrics_with_soil(struc_neg, soils_r)
+struc_bur <- compute_killion_metrics_with_soil(struc_bur, soils_r)
+struc_tai <- compute_killion_metrics_with_soil(struc_tai, soils_r)
+
+data_by_period$Neguanje$structures <- struc_neg
+data_by_period$Buritaca$structures <- struc_bur
+data_by_period$Tairona$structures <- struc_tai
+all_structures <- bind_rows(struc_neg, struc_bur, struc_tai)
+all_structures$Period <- factor(all_structures$Period, levels = periods)
+```
+
+# Robust Reporting Rules
+
+```{r robust-reporting-functions}
+fmt_p <- function(p, digits = 4) {
+  ifelse(is.na(p), NA_character_, ifelse(p < 0.001, "<0.001", format(signif(p, digits), scientific = FALSE)))
+}
+
+fmt_pm <- function(mean_value, sd_value, digits = 2) {
+  paste0(round(mean_value, digits), " ± ", round(sd_value, digits))
+}
+
+fmt_iqr <- function(median_value, iqr_value, digits = 2) {
+  paste0(round(median_value, digits), " (", round(iqr_value, digits), ")")
+}
+
+tukey_outlier_stats <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < 4) {
+    return(list(n_outliers = 0, prop_outliers = 0, lower_fence = NA_real_, upper_fence = NA_real_))
+  }
+  q1 <- as.numeric(quantile(x, 0.25, na.rm = TRUE, names = FALSE, type = 7))
+  q3 <- as.numeric(quantile(x, 0.75, na.rm = TRUE, names = FALSE, type = 7))
+  iqr <- q3 - q1
+  lower_fence <- q1 - 1.5 * iqr
+  upper_fence <- q3 + 1.5 * iqr
+  n_outliers <- sum(x < lower_fence | x > upper_fence, na.rm = TRUE)
+  list(n_outliers = n_outliers, prop_outliers = n_outliers / n, lower_fence = lower_fence, upper_fence = upper_fence)
+}
+
+shapiro_p_value <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < 3) return(NA_real_)
+  if (length(unique(x)) < 3) return(0)
+  if (n > 5000) {
+    set.seed(42)
+    x <- sample(x, 5000)
+  }
+  tryCatch(stats::shapiro.test(x)$p.value, error = function(e) NA_real_)
+}
+
+skewness_value <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < 3) return(NA_real_)
+  s <- stats::sd(x)
+  if (!is.finite(s) || s == 0) return(0)
+  mean(((x - mean(x)) / s)^3)
+}
+
+trimmed_sd <- function(x, trim = 0.10) {
+  x <- sort(x[is.finite(x)])
+  n <- length(x)
+  if (n < 4) return(stats::sd(x, na.rm = TRUE))
+  g <- ceiling(trim * n)
+  if ((n - 2 * g) < 2) return(stats::sd(x, na.rm = TRUE))
+  xw <- x
+  if (g > 0) {
+    xw[seq_len(g)] <- x[g + 1]
+    xw[(n - g + 1):n] <- x[n - g]
+  }
+  s2w <- stats::var(xw)
+  n_trimmed <- n - 2 * g
+  sqrt(((n - 1) * s2w) / (n_trimmed - 1))
+}
+
+select_drennan_summary <- function(x, trim = 0.10, normal_alpha = 0.05) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n == 0) {
+    return(list(method = "No_Data", center = NA_real_, spread = NA_real_, center_label = NA_character_, spread_label = NA_character_, shapiro_p = NA_real_, skewness = NA_real_, outlier_prop = NA_real_, zero_prop = NA_real_))
+  }
+
+  shapiro_p <- shapiro_p_value(x)
+  skew <- skewness_value(x)
+  out <- tukey_outlier_stats(x)
+  zero_prop <- mean(x == 0, na.rm = TRUE)
+  method <- "Mean_SD"
+
+  if (n < 5) {
+    method <- "Median_IQR"
+  } else if (is.finite(zero_prop) && zero_prop >= 0.10) {
+    method <- "Median_IQR"
+  } else if (is.finite(out$prop_outliers) && out$prop_outliers >= 0.10) {
+    method <- "Median_IQR"
+  } else if (is.finite(skew) && abs(skew) >= 1.25) {
+    method <- "Median_IQR"
+  } else if (is.finite(shapiro_p) && shapiro_p < 0.001) {
+    method <- "Median_IQR"
+  } else if ((is.finite(out$prop_outliers) && out$prop_outliers > 0) ||
+             (is.finite(skew) && abs(skew) >= 0.50) ||
+             (is.finite(shapiro_p) && shapiro_p < normal_alpha)) {
+    method <- "TrimmedMean_TrimmedSD"
+  }
+
+  if (method == "Mean_SD") {
+    center <- mean(x, na.rm = TRUE)
+    spread <- stats::sd(x, na.rm = TRUE)
+    center_label <- "Mean"
+    spread_label <- "SD"
+  } else if (method == "TrimmedMean_TrimmedSD") {
+    center <- mean(x, trim = trim, na.rm = TRUE)
+    spread <- trimmed_sd(x, trim = trim)
+    center_label <- paste0(trim * 100, "% trimmed mean")
+    spread_label <- paste0(trim * 100, "% trimmed SD")
+  } else {
+    center <- stats::median(x, na.rm = TRUE)
+    spread <- stats::IQR(x, na.rm = TRUE)
+    center_label <- "Median"
+    spread_label <- "IQR/midspread"
+  }
+
+  list(
+    method = method,
+    center = center,
+    spread = spread,
+    center_label = center_label,
+    spread_label = spread_label,
+    shapiro_p = shapiro_p,
+    skewness = skew,
+    outlier_prop = out$prop_outliers,
+    zero_prop = zero_prop
+  )
+}
+
+drennan_center <- function(x) {
+  select_drennan_summary(x)$center
+}
+
+kw_epsilon_squared <- function(kw, n, k) {
+  value <- (as.numeric(kw$statistic) - k + 1) / (n - k)
+  max(0, value)
+}
+```
+
+# Data Integrity and Reporting Diagnostic
+
+```{r data-integrity-diagnostic}
+cat("======================================================================\n")
+cat("DATA INTEGRITY AND ROBUST REPORTING DIAGNOSTIC\n")
+cat("======================================================================\n")
+for (period in periods) {
+  df <- st_drop_geometry(data_by_period[[period]]$structures)
+  auto_avail <- select_drennan_summary(df$Available_Space)
+  auto_diam <- select_drennan_summary(df$Diam_Terra)
+  cat(sprintf(
+    "%s (N=%d): NA_Soil=%d, NA_Avail=%d, Zero_Avail=%d (%.1f%%), Available_Space_Report=%s, Diameter_Report=%s\n",
+    period,
+    nrow(df),
+    sum(is.na(df$Soil_Quality)),
+    sum(is.na(df$Available_Space)),
+    sum(df$Available_Space == 0, na.rm = TRUE),
+    100 * sum(df$Available_Space == 0, na.rm = TRUE) / nrow(df),
+    auto_avail$method,
+    auto_diam$method
+  ))
+}
+```
+
+# TABLE 1
+
+```{r table-1}
+compute_period_stats <- function(struc_sf, period_name, survey_area_km2) {
+  n <- nrow(struc_sf)
+  NND <- struc_sf$NNDist
+  MNND <- mean(NND, na.rm = TRUE)
+  lambda <- n / (survey_area_km2 * 1e6)
+  R_index <- MNND / (0.5 / sqrt(lambda))
+
+  tibble(
+    Period = period_name,
+    `N structures` = format(n, big.mark = ","),
+    `Density/km2` = round(n / survey_area_km2, 2),
+    `Diameter mean ± SD (m)` = fmt_pm(mean(struc_sf$Diam_Terra, na.rm = TRUE), sd(struc_sf$Diam_Terra, na.rm = TRUE), 2),
+    `Diameter median (IQR) (m)` = fmt_iqr(median(struc_sf$Diam_Terra, na.rm = TRUE), IQR(struc_sf$Diam_Terra, na.rm = TRUE), 2),
+    `NND mean ± SD (m)` = fmt_pm(mean(NND, na.rm = TRUE), sd(NND, na.rm = TRUE), 2),
+    `NND median (IQR) (m)` = fmt_iqr(median(NND, na.rm = TRUE), IQR(NND, na.rm = TRUE), 2),
+    `Clark-Evans R` = round(R_index, 4),
+    `Available space mean ± SD (m)` = fmt_pm(mean(struc_sf$Available_Space, na.rm = TRUE), sd(struc_sf$Available_Space, na.rm = TRUE), 1),
+    `Available space median (IQR) (m)` = fmt_iqr(median(struc_sf$Available_Space, na.rm = TRUE), IQR(struc_sf$Available_Space, na.rm = TRUE), 1),
+    `Zero clearance n (%)` = paste0(
+      sum(struc_sf$Available_Space == 0, na.rm = TRUE),
+      " (",
+      round(100 * mean(struc_sf$Available_Space == 0, na.rm = TRUE), 1),
+      "%)"
+    ),
+    `Soil quality mean` = round(mean(struc_sf$Soil_Quality, na.rm = TRUE), 2),
+    `Soil quality median (IQR)` = fmt_iqr(median(struc_sf$Soil_Quality, na.rm = TRUE), IQR(struc_sf$Soil_Quality, na.rm = TRUE), 0)
+  )
+}
+
+table1 <- bind_rows(
+  compute_period_stats(struc_neg, "Neguanje", A_km2),
+  compute_period_stats(struc_bur, "Buritaca", A_km2),
+  compute_period_stats(struc_tai, "Tairona", A_km2)
+)
+
+knitr::kable(
+  table1,
+  caption = "TABLE 1: Settlement demography, terrace size, spacing, and robust descriptive summaries.",
+  align = "c"
+)
+```
+
+```{r table-1-diagnostic-console, results='asis'}
+cat("\nDiagnostic note for Table 1 (not a manuscript table):\n")
+for (period in periods) {
+  df <- st_drop_geometry(data_by_period[[period]]$structures)
+  variables <- list(
+    `Terrace diameter` = df$Diam_Terra,
+    `Nearest neighbor distance` = df$NNDist,
+    `Available space` = df$Available_Space,
+    `Space-core ratio` = df$Space_Core_Ratio
+  )
+  cat(sprintf("\n%s\n", toupper(period)))
+  for (nm in names(variables)) {
+    d <- select_drennan_summary(variables[[nm]])
+    cat(sprintf(
+      "%s: recommended=%s, center=%.3f, spread=%.3f, skewness=%.3f, outliers=%.1f%%, zeros=%.1f%%\n",
+      nm,
+      d$method,
+      d$center,
+      d$spread,
+      d$skewness,
+      100 * d$outlier_prop,
+      100 * d$zero_prop
+    ))
+  }
+}
+```
+
+# TABLE 2
+
+```{r table-2}
+extract_group_stat <- function(stats_df, group_name, value_name) {
+  out <- stats_df %>%
+    filter(Soil_Category == group_name) %>%
+    pull(all_of(value_name))
+  if (length(out) == 0) NA_real_ else out[1]
+}
+
+run_killion_soil_test <- function(struc_sf, period_name) {
+  df <- st_drop_geometry(struc_sf) %>%
+    filter(!is.na(Soil_Quality), !is.na(Available_Space), Available_Space >= 0, !is.na(Soil_Category))
+
+  sp <- suppressWarnings(cor.test(df$Soil_Quality, df$Available_Space, method = "spearman", exact = FALSE))
+  kw <- kruskal.test(Available_Space ~ Soil_Category, data = df)
+  k <- n_distinct(df$Soil_Category)
+  eps2 <- kw_epsilon_squared(kw, nrow(df), k)
+
+  stats <- df %>%
+    group_by(Soil_Category) %>%
+    summarise(
+      n = n(),
+      median = median(Available_Space, na.rm = TRUE),
+      iqr = IQR(Available_Space, na.rm = TRUE),
+      zeros = sum(Available_Space == 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  tibble(
+    Period = period_name,
+    N = format(nrow(df), big.mark = ","),
+    `Spearman rho` = round(as.numeric(sp$estimate), 4),
+    `Spearman p` = fmt_p(sp$p.value),
+    `Kruskal-Wallis H` = round(as.numeric(kw$statistic), 2),
+    df = as.numeric(kw$parameter),
+    `KW p` = fmt_p(kw$p.value),
+    `KW epsilon2` = round(eps2, 4),
+    `Low median (IQR)` = fmt_iqr(extract_group_stat(stats, "Low (1-2)", "median"), extract_group_stat(stats, "Low (1-2)", "iqr"), 1),
+    `Medium median (IQR)` = fmt_iqr(extract_group_stat(stats, "Medium (3-4)", "median"), extract_group_stat(stats, "Medium (3-4)", "iqr"), 1),
+    `High median (IQR)` = fmt_iqr(extract_group_stat(stats, "High (5-6)", "median"), extract_group_stat(stats, "High (5-6)", "iqr"), 1),
+    `Zero clearance low/medium/high` = paste0(
+      extract_group_stat(stats, "Low (1-2)", "zeros"), "/",
+      extract_group_stat(stats, "Medium (3-4)", "zeros"), "/",
+      extract_group_stat(stats, "High (5-6)", "zeros")
+    )
+  )
+}
+
+table2 <- bind_rows(
+  run_killion_soil_test(struc_neg, "Neguanje"),
+  run_killion_soil_test(struc_bur, "Buritaca"),
+  run_killion_soil_test(struc_tai, "Tairona")
+)
+
+knitr::kable(
+  table2,
+  caption = "TABLE 2: Rank-based tests of soil quality and available space with resistant summaries and effect sizes.",
+  align = "c"
+)
+```
+
+```{r table-2-pairwise-console, results='asis'}
+cat("\nPairwise Wilcoxon rank-sum tests with Holm-adjusted p-values (not a manuscript table):\n")
+for (period in periods) {
+  df <- st_drop_geometry(data_by_period[[period]]$structures) %>%
+    filter(!is.na(Soil_Quality), !is.na(Available_Space), Available_Space >= 0, !is.na(Soil_Category))
+  pw <- pairwise.wilcox.test(df$Available_Space, df$Soil_Category, p.adjust.method = "holm", exact = FALSE)
+  cat(sprintf("\n%s\n", toupper(period)))
+  for (r in rownames(pw$p.value)) {
+    for (cc in colnames(pw$p.value)) {
+      pv <- pw$p.value[r, cc]
+      if (!is.na(pv)) cat(sprintf("%s vs %s: p=%s\n", r, cc, fmt_p(pv)))
+    }
+  }
+}
+```
+
+```{r diachronic-diagnostic-console, results='asis'}
+run_auto_group_comparison <- function(data, response, group, label) {
+  df <- data %>%
+    st_drop_geometry() %>%
+    select(all_of(c(response, group))) %>%
+    filter(is.finite(.data[[response]]), !is.na(.data[[group]]))
+
+  overall <- select_drennan_summary(df[[response]])
+  kw <- kruskal.test(stats::as.formula(paste(response, "~", group)), data = df)
+  eps2 <- kw_epsilon_squared(kw, nrow(df), n_distinct(df[[group]]))
+
+  cat(sprintf(
+    "%s: recommended summary=%s; Kruskal-Wallis H=%.3f, df=%d, p=%s, epsilon2=%.4f\n",
+    label,
+    overall$method,
+    as.numeric(kw$statistic),
+    as.numeric(kw$parameter),
+    fmt_p(kw$p.value),
+    eps2
+  ))
+}
+
+cat("\nDiachronic diagnostic used for interpretation only (not a manuscript table):\n")
+run_auto_group_comparison(all_structures, "Diam_Terra", "Period", "Terrace diameter")
+run_auto_group_comparison(all_structures, "NNDist", "Period", "Nearest neighbor distance")
+run_auto_group_comparison(all_structures, "Available_Space", "Period", "Available space")
+run_auto_group_comparison(all_structures, "Space_Core_Ratio", "Period", "Space-core ratio")
+run_auto_group_comparison(all_structures, "Core_Area", "Period", "Core area")
+```
+
+# FIGURE 3: B Coefficient and Soil Suitability
+
+```{r figure-3, fig.cap="FIGURE 3: Agricultural potential, equal-area rings, B coefficient, and soil suitability by period."}
+soil_labels <- c("1. Very Low", "2. Low", "3. Medium-Low", "4. Medium-High", "5. High", "6. Optimal")
+soil_colors <- c("#5D3A00", "#A66C2D", "#D9B38C", "#B5E28A", "#4CAF50", "#006837")
+cls_levels <- sort(unique(terra::values(soils_r, na.rm = TRUE)))
+cls_levels <- cls_levels[is.finite(cls_levels)]
+if (length(cls_levels) > length(soil_labels)) cls_levels <- cls_levels[seq_len(length(soil_labels))]
+levels_map <- setNames(soil_labels[seq_len(length(cls_levels))], as.character(cls_levels))
+cols_map_labels <- setNames(soil_colors[seq_len(length(cls_levels))], unname(levels_map))
+
+df_ras <- as.data.frame(soils_r, xy = TRUE, na.rm = TRUE)
+colnames(df_ras) <- c("x", "y", "class")
+df_ras <- df_ras[is.finite(df_ras$class), ]
+df_ras$class <- factor(df_ras$class, levels = cls_levels, labels = unname(levels_map))
+
+B_params <- list(
+  Neguanje = list(n_rings = 12, dist_max = 5826.215, center_x = 599236, center_y = 1211131),
+  Buritaca = list(n_rings = 12, dist_max = 5847.356, center_x = 599202, center_y = 1211180),
+  Tairona = list(n_rings = 12, dist_max = 5992.292, center_x = 599413, center_y = 1212647)
+)
+
+B_results <- list()
+soil_results <- list()
+
+for (period in periods) {
+  params <- B_params[[period]]
+  struc_sf <- data_by_period[[period]]$structures
+  area_per_ring <- A_m2 / params$n_rings
+  cum_areas <- cumsum(rep(area_per_ring, params$n_rings))
+  radii <- sqrt(cum_areas / pi)
+  radii_scaled <- radii * (params$dist_max / max(radii))
+  center_pt <- st_sfc(st_point(c(params$center_x, params$center_y)), crs = st_crs(survey_union))
+  rings_list <- vector("list", params$n_rings)
+
+  for (j in seq_len(params$n_rings)) {
+    outer <- st_buffer(center_pt, dist = radii_scaled[j])
+    ring_geom <- if (j == 1) outer else suppressWarnings(st_difference(outer, st_buffer(center_pt, dist = radii_scaled[j - 1])))
+    rings_list[[j]] <- st_collection_extract(st_make_valid(suppressWarnings(st_intersection(ring_geom, survey_union))), "POLYGON", warn = FALSE)
+  }
+
+  valid_rings <- Filter(function(x) !st_is_empty(x) && length(x) > 0, rings_list)
+  rings_sf <- do.call(rbind, lapply(seq_along(valid_rings), function(k) st_sf(geometry = valid_rings[[k]], ring = k))) %>%
+    st_make_valid()
+  counts <- sapply(valid_rings, function(r) sum(st_within(struc_sf, r, sparse = FALSE)))
+  rings_sf$count <- as.integer(counts)
+  total <- sum(counts)
+  table_rings <- data.frame(Ring = rings_sf$ring, Count = rings_sf$count, Prop = rings_sf$count / total)
+  w <- rev(seq_len(nrow(table_rings)))
+  B <- (100 * sum(w * table_rings$Prop) - 650) / 550
+  wp <- sum(w * table_rings$Prop)
+  var_wp <- max(0, (sum((w^2) * table_rings$Prop) - wp^2) / total)
+  se_B <- (100 / 550) * sqrt(var_wp)
+  B95 <- 1.96 * se_B
+  B_results[[period]] <- list(B = B, B_ci = c(B - B95, B + B95), rings_sf = rings_sf, total = total)
+
+  pbc <- as.data.frame(table(struc_sf$Soil_Quality))
+  colnames(pbc) <- c("class", "n")
+  pbc$class <- factor(pbc$class, levels = cls_levels, labels = unname(levels_map))
+  pbc$prop <- pbc$n / sum(pbc$n)
+  soil_results[[period]] <- list(prop_by_class = pbc)
+}
+
+soil_map_plots <- list()
+soil_prop_plots <- list()
+for (i in seq_along(periods)) {
+  period <- periods[i]
+  res_B <- B_results[[period]]
+  sites_sf <- data_by_period[[period]]$sites
+
+  soil_map_plots[[period]] <- ggplot() +
+    geom_raster(data = df_ras, aes(x = x, y = y, fill = class)) +
+    geom_sf(data = survey_union, fill = NA, color = "black", linetype = "dashed", linewidth = 0.8) +
+    geom_sf(data = res_B$rings_sf, fill = NA, color = "red", linewidth = 0.6) +
+    geom_sf(data = sites_sf, fill = "black", color = "black", linewidth = 0.25) +
+    coord_sf(datum = NA) +
+    scale_fill_manual(values = cols_map_labels, drop = FALSE, name = "Soil suitability") +
+    ggspatial::annotation_north_arrow(location = "tl", style = north_arrow_fancy_orienteering(), height = unit(0.8, "cm"), width = unit(0.8, "cm")) +
+    ggspatial::annotation_scale(location = "br", unit_category = "metric") +
+    labs(title = paste0(LETTERS[i], ". ", period, " — Agricultural potential"), subtitle = sprintf("B = %.4f [%.4f, %.4f]", res_B$B, res_B$B_ci[1], res_B$B_ci[2])) +
+    theme_bw() +
+    theme(legend.position = "right", plot.title = element_text(face = "bold", size = 10), plot.subtitle = element_text(size = 8), axis.text = element_blank(), axis.ticks = element_blank())
+
+  res <- soil_results[[period]]
+  soil_prop_plots[[period]] <- ggplot(res$prop_by_class, aes(x = class, y = prop, fill = class)) +
+    geom_col(color = "black", width = 0.6) +
+    geom_text(aes(label = scales::percent(prop, accuracy = 0.1)), vjust = -0.35, size = 2.5) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, max(res$prop_by_class$prop) * 1.3)) +
+    scale_fill_manual(values = cols_map_labels, drop = FALSE) +
+    guides(fill = "none") +
+    labs(title = paste0(LETTERS[i + 3], ". ", period, " — Infield soil quality"), x = "Agricultural suitability", y = "% structures") +
+    theme_bw() +
+    theme(plot.title = element_text(face = "bold", size = 9), axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+}
+
+fig3 <- (soil_map_plots$Neguanje | soil_map_plots$Buritaca | soil_map_plots$Tairona) /
+  (soil_prop_plots$Neguanje | soil_prop_plots$Buritaca | soil_prop_plots$Tairona) +
+  plot_annotation(title = "FIGURE 3")
+print(fig3)
+
+soil_contingency <- data.frame(Class = soil_labels, Neguanje = 0, Buritaca = 0, Tairona = 0)
+for (period in periods) {
+  res <- soil_results[[period]]
+  for (j in seq_len(nrow(res$prop_by_class))) {
+    idx <- which(soil_contingency$Class == as.character(res$prop_by_class$class[j]))
+    if (length(idx) > 0) soil_contingency[idx, period] <- res$prop_by_class$n[j]
+  }
+}
+soil_matrix <- as.matrix(soil_contingency[rowSums(soil_contingency[, -1]) > 0, -1])
+chi_soils <- chisq.test(soil_matrix)
+cramer_v <- sqrt(as.numeric(chi_soils$statistic) / (sum(soil_matrix) * (min(dim(soil_matrix)) - 1)))
+cat(sprintf("Chi-square=%.2f, df=%d, p=%s, Cramer's V=%.4f\n", as.numeric(chi_soils$statistic), as.numeric(chi_soils$parameter), fmt_p(chi_soils$p.value), cramer_v))
+```
+
+# FIGURE 4: Available Space by Soil Category and Period
+
+```{r figure-4, fig.cap="FIGURE 4: Available space by soil category and period. Boxplots show the distribution of inter-structure available space grouped into low (classes 1–2), medium (classes 3–4), and high (classes 5–6) suitability categories. All structures with available space equal to or greater than zero are included. All panels use the same pseudo-logarithmic vertical axis with fixed limits from 0 to 100,000 m. Pairwise significance brackets display Holm-adjusted Wilcoxon rank-sum p-values."}
+soil_cat_colors <- c("Low (1-2)" = "#A66C2D", "Medium (3-4)" = "#D9B38C", "High (5-6)" = "#4CAF50")
+soil_comparisons <- list(c("Low (1-2)", "Medium (3-4)"), c("Medium (3-4)", "High (5-6)"), c("Low (1-2)", "High (5-6)"))
+df_all <- st_drop_geometry(all_structures) %>%
+  filter(!is.na(Soil_Category), Available_Space >= 0)
+
+create_soil_boxplot <- function(data, period_name, label) {
+  df_period <- data %>% filter(Period == period_name)
+  kw <- kruskal.test(Available_Space ~ Soil_Category, data = df_period)
+  eps2 <- kw_epsilon_squared(kw, nrow(df_period), n_distinct(df_period$Soil_Category))
+  auto <- select_drennan_summary(df_period$Available_Space)
+  kw_text <- sprintf("Kruskal-Wallis H = %.2f, p = %s, epsilon2 = %.3f | %s | N = %d", as.numeric(kw$statistic), fmt_p(kw$p.value), eps2, auto$method, nrow(df_period))
+
+  pw_raw <- pairwise.wilcox.test(df_period$Available_Space, df_period$Soil_Category, p.adjust.method = "none", exact = FALSE)
+  pw_holm <- pairwise.wilcox.test(df_period$Available_Space, df_period$Soil_Category, p.adjust.method = "holm", exact = FALSE)
+  raw_vec <- c(pw_raw$p.value["Medium (3-4)", "Low (1-2)"], pw_raw$p.value["High (5-6)", "Medium (3-4)"], pw_raw$p.value["High (5-6)", "Low (1-2)"])
+  holm_vec <- c(pw_holm$p.value["Medium (3-4)", "Low (1-2)"], pw_holm$p.value["High (5-6)", "Medium (3-4)"], pw_holm$p.value["High (5-6)", "Low (1-2)"])
+
+  holm_map <- function(p) {
+    idx <- which.min(abs(raw_vec - p))
+    hp <- holm_vec[idx]
+    if (is.na(hp)) return("p = NA")
+    if (hp < 0.001) "p < 0.001" else sprintf("p = %.3f", hp)
+  }
+
+  ggplot(df_period, aes(x = Soil_Category, y = Available_Space, fill = Soil_Category)) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.5, shape = 21, color = "black") +
+    geom_boxplot(width = 0.4, alpha = 0.9, color = "black", outlier.colour = "red", outlier.fill = "red", outlier.shape = 21, outlier.size = 1.5) +
+    scale_fill_manual(values = soil_cat_colors) +
+    geom_signif(comparisons = soil_comparisons, step_increase = 0.12, test = "wilcox.test", test.args = list(exact = FALSE), textsize = 2.5, map_signif_level = holm_map) +
+    scale_y_continuous(
+  trans = scales::pseudo_log_trans(base = 10),
+  limits = c(0, 100000),
+  breaks = c(0, 1, 10, 100, 1000, 10000, 100000),
+  labels = scales::comma
+) +
+    labs(title = paste0(label, ". ", period_name), subtitle = kw_text, x = "Soil category", y = "Available space (m, pseudo-log scale)") +
+    theme_bw() +
+    theme(legend.position = "none", plot.title = element_text(face = "bold", size = 11, hjust = 0.5), plot.subtitle = element_text(size = 9, hjust = 0.5, color = "gray30"), axis.text.x = element_text(size = 8))
+}
+
+fig4 <- create_soil_boxplot(df_all, "Neguanje", "A") |
+  create_soil_boxplot(df_all, "Buritaca", "B") |
+  create_soil_boxplot(df_all, "Tairona", "C")
+fig4 + plot_annotation(title = "FIGURE 4: Available Space by Soil Category and Period")
+
+cat("\nFIGURE 4 SCALE CHECK: all panels use pseudo-log vertical limits from 0 to 100000 m, with breaks at 0, 1, 10, 100, 1000, 10000, and 100000.\n")
+```
+
+# FIGURE 5: Neighborhood Infield Index
+
+```{r figure-5, fig.cap="FIGURE 5: Neighborhood Infield Index using the primary mean-based site definition, with robust sensitivity printed below."}
+build_site_network <- function(sites_sf, struc_sf, k = 3, use_robust_center = FALSE) {
+  sites_valid <- sites_sf %>%
+    st_make_valid() %>%
+    mutate(Site_ID = row_number())
+  centroids <- st_centroid(sites_valid)
+  coords <- st_coordinates(centroids)
+  struc_with_site <- st_join(struc_sf, sites_valid)
+
+  center_fun <- if (use_robust_center) drennan_center else function(x) mean(x, na.rm = TRUE)
+
+  site_metrics <- st_drop_geometry(struc_with_site) %>%
+    filter(!is.na(Site_ID)) %>%
+    group_by(Site_ID) %>%
+    summarise(
+      N_Structures = n(),
+      Center_Avail_Space = center_fun(Available_Space),
+      Mean_Avail_Space = mean(Available_Space, na.rm = TRUE),
+      Mean_Soil_Quality = mean(Soil_Quality, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(Dominant_Soil = case_when(
+      Mean_Soil_Quality <= 2 ~ "Low (1-2)",
+      Mean_Soil_Quality <= 4 ~ "Medium (3-4)",
+      TRUE ~ "High (5-6)"
+    ))
+
+  sites_final <- sites_valid %>%
+    inner_join(site_metrics, by = "Site_ID") %>%
+    bind_cols(as.data.frame(coords[sites_valid$Site_ID %in% site_metrics$Site_ID, , drop = FALSE])) %>%
+    rename(x = X, y = Y)
+
+  n <- nrow(sites_final)
+  if (n < 2) return(NULL)
+  coords_final <- cbind(sites_final$x, sites_final$y)
+  D <- as.matrix(dist(coords_final))
+  diag(D) <- Inf
+  adj <- matrix(FALSE, n, n)
+  site_NII <- numeric(n)
+
+  for (i in seq_len(n)) {
+    k_eff <- min(k, n - 1)
+    neighbors <- order(D[i, ])[seq_len(k_eff)]
+    adj[i, neighbors] <- TRUE
+    site_NII[i] <- mean(sites_final$Center_Avail_Space[neighbors], na.rm = TRUE)
+  }
+
+  adj <- adj | t(adj)
+  list(sites_sf = sites_final, coords = coords_final, adj = adj, NII = site_NII)
+}
+
+net_neg_site <- build_site_network(sites_neg, struc_neg, k = 3, use_robust_center = FALSE)
+net_bur_site <- build_site_network(sites_bur, struc_bur, k = 3, use_robust_center = FALSE)
+net_tai_site <- build_site_network(sites_tai, struc_tai, k = 3, use_robust_center = FALSE)
+
+plot_site_network <- function(net_result, survey_sf, period_name, label) {
+  if (is.null(net_result)) return(ggplot() + theme_void())
+  dat <- net_result$sites_sf
+  coords <- net_result$coords
+  adj <- net_result$adj
+  edges_idx <- which(adj & upper.tri(adj), arr.ind = TRUE)
+  edges_df <- data.frame(
+    x = coords[edges_idx[, 1], 1],
+    y = coords[edges_idx[, 1], 2],
+    xend = coords[edges_idx[, 2], 1],
+    yend = coords[edges_idx[, 2], 2]
+  )
+  nodes_df <- data.frame(
+    x = coords[, 1],
+    y = coords[, 2],
+    Soil_Category = factor(dat$Dominant_Soil, levels = c("Low (1-2)", "Medium (3-4)", "High (5-6)")),
+    Avg_Space = dat$Mean_Avail_Space
+  )
+
+  ggplot() +
+    geom_sf(data = survey_sf, fill = "gray95", color = "gray70") +
+    geom_segment(data = edges_df, aes(x = x, y = y, xend = xend, yend = yend), color = "gray70", linewidth = 0.1, alpha = 0.3) +
+    geom_point(data = nodes_df, aes(x = x, y = y, fill = Soil_Category, size = Avg_Space), shape = 21, color = "black", stroke = 0.3) +
+    scale_fill_manual(values = soil_cat_colors, name = "Soil category", drop = FALSE) +
+    scale_size_continuous(range = c(1.5, 6), name = expression("Avg infield (m)")) +
+    coord_sf(datum = NA) +
+    ggspatial::annotation_north_arrow(location = "tl", style = north_arrow_fancy_orienteering(), height = unit(0.6, "cm"), width = unit(0.6, "cm")) +
+    ggspatial::annotation_scale(location = "br", unit_category = "metric") +
+    labs(title = paste0(label, ". ", period_name)) +
+    theme_void() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 10), legend.position = "right")
+}
+
+plot_site_NII_box <- function(net_result, period_name, label) {
+  if (is.null(net_result)) return(ggplot() + theme_void())
+  df <- data.frame(
+    NII = net_result$NII,
+    Soil_Category = factor(net_result$sites_sf$Dominant_Soil, levels = c("Low (1-2)", "Medium (3-4)", "High (5-6)"))
+  ) %>%
+    filter(!is.na(Soil_Category), !is.na(NII), NII > 0)
+
+  kw <- kruskal.test(NII ~ Soil_Category, data = df)
+  eps2 <- kw_epsilon_squared(kw, nrow(df), n_distinct(df$Soil_Category))
+  kw_text <- sprintf("Kruskal-Wallis H = %.2f, p = %s, epsilon2 = %.3f", as.numeric(kw$statistic), fmt_p(kw$p.value), eps2)
+
+  pw_raw <- pairwise.wilcox.test(df$NII, df$Soil_Category, p.adjust.method = "none", exact = FALSE)
+  pw_holm <- pairwise.wilcox.test(df$NII, df$Soil_Category, p.adjust.method = "holm", exact = FALSE)
+  raw_vec <- c(pw_raw$p.value["Medium (3-4)", "Low (1-2)"], pw_raw$p.value["High (5-6)", "Medium (3-4)"], pw_raw$p.value["High (5-6)", "Low (1-2)"])
+  holm_vec <- c(pw_holm$p.value["Medium (3-4)", "Low (1-2)"], pw_holm$p.value["High (5-6)", "Medium (3-4)"], pw_holm$p.value["High (5-6)", "Low (1-2)"])
+  holm_map <- function(p) {
+    idx <- which.min(abs(raw_vec - p))
+    hp <- holm_vec[idx]
+    if (is.na(hp)) return("p = NA")
+    if (hp < 0.001) "p < 0.001" else sprintf("p = %.3f", hp)
+  }
+
+  ggplot(df, aes(x = Soil_Category, y = NII, fill = Soil_Category)) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.5, shape = 21, color = "black") +
+    geom_boxplot(width = 0.1, alpha = 1, color = "black", outlier.colour = "black", outlier.fill = "red", outlier.shape = 21, outlier.size = 1.5) +
+    scale_fill_manual(values = soil_cat_colors) +
+    geom_signif(comparisons = soil_comparisons, step_increase = 0.12, test = "wilcox.test", test.args = list(exact = FALSE), textsize = 2.5, map_signif_level = holm_map) +
+    scale_y_log10(labels = scales::comma) +
+    labs(title = paste0(label, ". ", period_name), subtitle = kw_text, x = "Soil category", y = "NII (m, log scale)") +
+    theme_bw() +
+    theme(legend.position = "none", plot.title = element_text(face = "bold", size = 10, hjust = 0.5), plot.subtitle = element_text(size = 8, hjust = 0.5, color = "gray30"), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+}
+
+fig5 <- (plot_site_network(net_neg_site, survey_sf, "Neguanje", "A") | plot_site_network(net_bur_site, survey_sf, "Buritaca", "B") | plot_site_network(net_tai_site, survey_sf, "Tairona", "C")) /
+  (plot_site_NII_box(net_neg_site, "Neguanje", "D") | plot_site_NII_box(net_bur_site, "Buritaca", "E") | plot_site_NII_box(net_tai_site, "Tairona", "F")) +
+  plot_annotation(title = "FIGURE 5: Neighborhood Infield Index (NII) by Soil Category")
+print(fig5)
+```
+
+```{r figure-5-numerical-summary, results='asis'}
+cat("\nFIGURE 5 NUMERICAL SUMMARY, PRIMARY MEAN-BASED NII (k=3):\n")
+net_list <- list(net_neg_site, net_bur_site, net_tai_site)
+for (i in seq_along(periods)) {
+  net_data <- net_list[[i]]
+  if (!is.null(net_data)) {
+    df_s <- net_data$sites_sf %>%
+      mutate(NII = net_data$NII) %>%
+      st_drop_geometry() %>%
+      filter(!is.na(Dominant_Soil), !is.na(NII))
+    sp <- suppressWarnings(cor.test(df_s$Mean_Soil_Quality, df_s$NII, method = "spearman", exact = FALSE))
+    kw <- kruskal.test(NII ~ Dominant_Soil, data = df_s)
+    eps2 <- kw_epsilon_squared(kw, nrow(df_s), n_distinct(df_s$Dominant_Soil))
+    stats <- df_s %>%
+      group_by(Dominant_Soil) %>%
+      summarise(n = n(), mean_NII = mean(NII), median_NII = median(NII), iqr_NII = IQR(NII), .groups = "drop")
+    cat(sprintf("\n%s (N=%d): rho=%.4f, p=%s | KW H=%.2f, p=%s, epsilon2=%.4f\n", toupper(periods[i]), nrow(df_s), as.numeric(sp$estimate), fmt_p(sp$p.value), as.numeric(kw$statistic), fmt_p(kw$p.value), eps2))
+    for (j in seq_len(nrow(stats))) {
+      cat(sprintf("%s: n=%d, mean=%.1f, median=%.1f, IQR=%.1f\n", stats$Dominant_Soil[j], stats$n[j], stats$mean_NII[j], stats$median_NII[j], stats$iqr_NII[j]))
+    }
+  }
+}
+
+cat("\nROBUST NII SENSITIVITY, NOT USED FOR THE MAIN FIGURE:\n")
+net_neg_rob <- build_site_network(sites_neg, struc_neg, k = 3, use_robust_center = TRUE)
+net_bur_rob <- build_site_network(sites_bur, struc_bur, k = 3, use_robust_center = TRUE)
+net_tai_rob <- build_site_network(sites_tai, struc_tai, k = 3, use_robust_center = TRUE)
+net_rob_list <- list(net_neg_rob, net_bur_rob, net_tai_rob)
+for (i in seq_along(periods)) {
+  net_data <- net_rob_list[[i]]
+  if (!is.null(net_data)) {
+    df_s <- net_data$sites_sf %>%
+      mutate(NII = net_data$NII) %>%
+      st_drop_geometry() %>%
+      filter(!is.na(Dominant_Soil), !is.na(NII))
+    kw <- kruskal.test(NII ~ Dominant_Soil, data = df_s)
+    eps2 <- kw_epsilon_squared(kw, nrow(df_s), n_distinct(df_s$Dominant_Soil))
+    cat(sprintf("%s robust sensitivity: KW H=%.2f, p=%s, epsilon2=%.4f\n", periods[i], as.numeric(kw$statistic), fmt_p(kw$p.value), eps2))
+  }
+}
+```
+
+# FIGURE 6: L-Function
+
+```{r figure-6, fig.cap="FIGURE 6: Centered L-function stratified by low and high soil quality. The panels use period-specific vertical scales to preserve within-period curve legibility. Cross-period comparison should therefore rely on the reported peak L(r) values and associated distances in the numerical summary, rather than on visual curve height alone."}
+compute_L_centered <- function(struc_sf, survey_sf, soil_group, period_name, nsim = 99) {
+  struc_sub <- if (soil_group == "High") {
+    struc_sf %>% filter(Soil_Quality >= 5)
+  } else {
+    struc_sf %>% filter(Soil_Quality <= 2)
+  }
+  if (nrow(struc_sub) < 10) {
+    return(data.frame(r = NA, L_val = NA, L_lo = NA, L_hi = NA, Period = period_name, Soil_Group = soil_group))
+  }
+  coords <- st_coordinates(struc_sub)
+  W <- as.owin(st_geometry(survey_sf))
+  pp <- ppp(x = coords[, 1], y = coords[, 2], window = W)
+  env <- tryCatch(
+    envelope(pp, fun = Lest, nsim = nsim, correction = "isotropic", global = TRUE, savefuns = TRUE, verbose = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(env)) {
+    return(data.frame(r = NA, L_val = NA, L_lo = NA, L_hi = NA, Period = period_name, Soil_Group = soil_group))
+  }
+  data.frame(
+    r = env$r,
+    L_val = env$obs - env$r,
+    L_lo = env$lo - env$r,
+    L_hi = env$hi - env$r,
+    Period = period_name,
+    Soil_Group = soil_group
+  )
+}
+
+L_data <- bind_rows(
+  compute_L_centered(struc_neg, survey_sf, "High", "Neguanje"),
+  compute_L_centered(struc_neg, survey_sf, "Low", "Neguanje"),
+  compute_L_centered(struc_bur, survey_sf, "High", "Buritaca"),
+  compute_L_centered(struc_bur, survey_sf, "Low", "Buritaca"),
+  compute_L_centered(struc_tai, survey_sf, "High", "Tairona"),
+  compute_L_centered(struc_tai, survey_sf, "Low", "Tairona")
+) %>%
+  filter(!is.na(r))
+
+L_data$Period <- factor(L_data$Period, levels = periods)
+L_data$Soil_Group <- factor(L_data$Soil_Group, levels = c("Low", "High"))
+
+fig6 <- ggplot(L_data, aes(x = r)) +
+  geom_ribbon(aes(ymin = L_lo, ymax = L_hi, fill = Soil_Group), alpha = 0.2) +
+  geom_line(aes(y = L_val, color = Soil_Group), linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ Period, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = c("Low" = "#A66C2D", "High" = "#4CAF50"), name = "Soil quality") +
+  scale_fill_manual(values = c("Low" = "#A66C2D", "High" = "#4CAF50"), name = "Soil quality") +
+  labs(title = "FIGURE 6: Point Pattern Clustering Stratified by Soil Category", x = "Distance r (m)", y = "L(r) - r (clustering intensity)") +
+  theme_bw() +
+  theme(aspect.ratio = 0.8, legend.position = "bottom", strip.text = element_text(face = "bold", size = 12))
+print(fig6)
+```
+
+```{r figure-6-numerical-summary, results='asis'}
+cat("\nFIGURE 6 NUMERICAL SUMMARY:\n")
+for (period in periods) {
+  for (sg in c("Low", "High")) {
+    sub <- L_data %>% filter(Period == period, Soil_Group == sg, !is.na(L_val))
+    if (nrow(sub) > 0) {
+      n_s <- ifelse(
+        sg == "High",
+        sum(data_by_period[[period]]$structures$Soil_Quality >= 5, na.rm = TRUE),
+        sum(data_by_period[[period]]$structures$Soil_Quality <= 2, na.rm = TRUE)
+      )
+      cat(sprintf("%s - %s (n=%d): peak=%.1f at r=%.0f m, mean=%.1f\n", period, sg, n_s, max(sub$L_val), sub$r[which.max(sub$L_val)], mean(sub$L_val)))
+    }
+  }
+}
+```
+
+# FIGURE 7: Multidimensional Scaling
+
+```{r figure-7, fig.cap="FIGURE 7: Multidimensional scaling of site-scale house-lot organization using the primary mean-based aggregation."}
+compute_site_metrics_with_soil <- function(sites_sf, struc_sf, period_name, use_robust_center = FALSE) {
+  sites_sf <- st_make_valid(sites_sf)
+  sites_b <- st_buffer(sites_sf, dist = 1)
+  im <- st_intersects(struc_sf, sites_b, sparse = FALSE)
+  ns <- colSums(im)
+  md <- mn <- ms <- numeric(nrow(sites_sf))
+  ds <- character(nrow(sites_sf))
+  center_fun <- if (use_robust_center) drennan_center else function(x) mean(x, na.rm = TRUE)
+
+  for (j in seq_len(nrow(sites_sf))) {
+    idx <- which(im[, j])
+    if (length(idx) > 0) {
+      md[j] <- center_fun(struc_sf$Diam_Terra[idx])
+      mn[j] <- center_fun(struc_sf$NNDist[idx])
+      ms[j] <- center_fun(struc_sf$Soil_Quality[idx])
+      ds[j] <- if (ms[j] <= 2) "Low (1-2)" else if (ms[j] <= 4) "Medium (3-4)" else "High (5-6)"
+    } else {
+      md[j] <- NA
+      mn[j] <- NA
+      ms[j] <- NA
+      ds[j] <- NA
+    }
+  }
+
+  sdf <- st_drop_geometry(sites_sf)
+  sdf$N_Structures <- ns
+  sdf$Center_Diam_Terra <- md
+  sdf$Center_NNDist <- mn
+  sdf$Center_Soil_Quality <- ms
+  sdf$Dominant_Soil <- factor(ds, levels = c("Low (1-2)", "Medium (3-4)", "High (5-6)"))
+  sdf$Period <- period_name
+  sdf
+}
+
+sm_neg <- compute_site_metrics_with_soil(sites_neg, struc_neg, "Neguanje", use_robust_center = FALSE)
+sm_bur <- compute_site_metrics_with_soil(sites_bur, struc_bur, "Buritaca", use_robust_center = FALSE)
+sm_tai <- compute_site_metrics_with_soil(sites_tai, struc_tai, "Tairona", use_robust_center = FALSE)
+
+create_mds_panel <- function(sm, period_name, label) {
+  v <- sm %>%
+    filter(N_Structures > 0, is.finite(Center_Diam_Terra), is.finite(Center_NNDist), is.finite(Center_Soil_Quality)) %>%
+    select(N_Structures, Center_Diam_Terra, Center_NNDist, Center_Soil_Quality, Dominant_Soil)
+
+  if (nrow(v) < 5) return(ggplot() + theme_void())
+
+  m <- scale(v %>% select(Center_Diam_Terra, Center_NNDist, Center_Soil_Quality))
+  r <- cmdscale(dist(m), k = 2, eig = TRUE)
+  ve <- round(r$eig[1:2] / sum(abs(r$eig)) * 100, 1)
+  d <- data.frame(D1 = r$points[, 1], D2 = r$points[, 2], N = v$N_Structures, Soil = v$Dominant_Soil)
+
+  ggplot(d, aes(x = D1, y = D2)) +
+    geom_point(aes(size = N, fill = Soil), color = "black", shape = 21, stroke = 0.5, alpha = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    scale_size_continuous(range = c(1, 8), name = "Structures") +
+    scale_fill_manual(values = soil_cat_colors, name = "Dominant soil", drop = FALSE) +
+    labs(title = paste0(label, ". ", period_name), subtitle = paste0("Dim 1: ", ve[1], "% | Dim 2: ", ve[2], "%"), x = paste0("Dim 1 (", ve[1], "%)"), y = paste0("Dim 2 (", ve[2], "%)")) +
+    theme_bw() +
+    theme(plot.title = element_text(face = "bold", size = 11, hjust = 0.5), plot.subtitle = element_text(size = 9, hjust = 0.5), legend.position = "right") +
+    coord_fixed()
+}
+
+fig7 <- create_mds_panel(sm_neg, "Neguanje", "A") |
+  create_mds_panel(sm_bur, "Buritaca", "B") |
+  create_mds_panel(sm_tai, "Tairona", "C")
+fig7 + plot_annotation(title = "FIGURE 7: Multidimensional Scaling of Site-Scale House-Lot Organization")
+```
+
+```{r figure-7-numerical-summary, results='asis'}
+cat("\nFIGURE 7 NUMERICAL SUMMARY, PRIMARY MEAN-BASED MDS:\n")
+for (item in list(list(d = sm_neg, n = "NEGUANJE"), list(d = sm_bur, n = "BURITACA"), list(d = sm_tai, n = "TAIRONA"))) {
+  v <- item$d %>%
+    filter(N_Structures > 0, is.finite(Center_Diam_Terra), is.finite(Center_NNDist), is.finite(Center_Soil_Quality))
+  st <- v %>%
+    group_by(Dominant_Soil) %>%
+    summarise(
+      n = n(),
+      diameter = mean(Center_Diam_Terra),
+      nnd = mean(Center_NNDist),
+      soil = mean(Center_Soil_Quality),
+      structures = mean(N_Structures),
+      .groups = "drop"
+    )
+  r <- cmdscale(dist(scale(v %>% select(Center_Diam_Terra, Center_NNDist, Center_Soil_Quality))), k = 2, eig = TRUE)
+  ve <- round(r$eig[1:2] / sum(abs(r$eig)) * 100, 1)
+  cat(sprintf("\n%s (N=%d):\n", item$n, nrow(v)))
+  for (j in seq_len(nrow(st))) {
+    cat(sprintf("%s: n=%d, diameter=%.1f, NND=%.1f, soil=%.2f, structures=%.1f\n", st$Dominant_Soil[j], st$n[j], st$diameter[j], st$nnd[j], st$soil[j], st$structures[j]))
+  }
+  cat(sprintf("Variance: Dim1=%.1f%%, Dim2=%.1f%%\n", ve[1], ve[2]))
+}
+
+cat("\nROBUST MDS SENSITIVITY, NOT USED FOR THE MAIN FIGURE:\n")
+sm_neg_rob <- compute_site_metrics_with_soil(sites_neg, struc_neg, "Neguanje", use_robust_center = TRUE)
+sm_bur_rob <- compute_site_metrics_with_soil(sites_bur, struc_bur, "Buritaca", use_robust_center = TRUE)
+sm_tai_rob <- compute_site_metrics_with_soil(sites_tai, struc_tai, "Tairona", use_robust_center = TRUE)
+for (item in list(list(d = sm_neg_rob, n = "NEGUANJE"), list(d = sm_bur_rob, n = "BURITACA"), list(d = sm_tai_rob, n = "TAIRONA"))) {
+  v <- item$d %>%
+    filter(N_Structures > 0, is.finite(Center_Diam_Terra), is.finite(Center_NNDist), is.finite(Center_Soil_Quality))
+  r <- cmdscale(dist(scale(v %>% select(Center_Diam_Terra, Center_NNDist, Center_Soil_Quality))), k = 2, eig = TRUE)
+  ve <- round(r$eig[1:2] / sum(abs(r$eig)) * 100, 1)
+  cat(sprintf("%s robust sensitivity: N=%d, Dim1=%.1f%%, Dim2=%.1f%%\n", item$n, nrow(v), ve[1], ve[2]))
+}
+```
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
